@@ -3,6 +3,7 @@ use exif::read_exif;
 use log::info;
 use memmap::{Mmap, MmapOptions};
 use rayon::prelude::*;
+use std::io::BufWriter;
 
 mod exif;
 
@@ -14,13 +15,6 @@ struct Args {
 
     #[arg(short, long, value_parser, num_args = 1.., value_delimiter = ' ')]
     input_files: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Color {
-    Red,
-    Green,
-    Blue,
 }
 
 fn sequence_to_group_id(t: u32) -> (u32, u32) {
@@ -40,19 +34,14 @@ fn sequence_to_group_id(t: u32) -> (u32, u32) {
     (group_id, id)
 }
 
-/// R G R G
-/// G B G B
-/// R G R G
-/// G B G B
-fn bayer_pattern(x: u32, y: u32) -> Color {
-    // what the fuck?
-    let v = 0x94949494u32 >> ((((x) << 1 & 14) + ((y) & 1)) << 1) & 3;
-
+fn dng_color_channel(row: u32, col: u32) -> usize {
+    // Mirrors make_arq.py:dngcolor(); returns 0..2 (R,G,B) for RGGB pattern
+    let v = (0x94949494u32 >> ((((row) << 1 & 14) + ((col) & 1)) << 1)) & 3;
     match v {
-        0 => Color::Red,
-        1 => Color::Green,
-        2 => Color::Blue,
-        3 => Color::Green,
+        0 => 0, // R
+        1 => 1, // G
+        2 => 2, // B
+        3 => 1, // (shouldn't happen for this pattern, but treat as G)
         _ => unreachable!(),
     }
 }
@@ -67,6 +56,7 @@ struct RawImage<'a> {
     id_in_group: u32, // which image in the group this image is
     _mmap: Mmap,
     data_pixels: &'a [u16],
+    exif: exif::ExifData,
 }
 
 impl<'a> RawImage<'a> {
@@ -95,6 +85,7 @@ impl<'a> RawImage<'a> {
             id_in_group: gi.1,
             _mmap: data,
             data_pixels: data_slice_u16,
+            exif,
         }
     }
 
@@ -119,23 +110,32 @@ impl<'a> RawImage<'a> {
     }
 }
 
-fn merge_4(files: &[RawImage], x: u32, y: u32) -> image::Rgb<u16> {
-    let mut px = image::Rgb([0u16, 0, 0]);
+fn fill_sony_frame_dng_rgb(
+    out: &mut [u16],
+    out_width: u32,
+    out_height: u32,
+    file: &RawImage,
+    idx: u32,
+    factor: u32,
+) {
+    let (r_off, c_off) = file.inter_group_offsets();
+    let group = idx / 4;
+    let rowstart = if group >= 2 { 1 } else { 0 };
+    let colstart = if group % 2 == 1 { 1 } else { 0 };
 
-    for file in files {
-        let offset = file.inter_group_offsets();
-
-        let val = file.get_pixel(x - offset.1, y - offset.0) as u32;
-        let color = bayer_pattern(x - offset.1, y - offset.0);
-
-        match color {
-            Color::Red => px.0[0] += (val) as u16,
-            Color::Green => px.0[1] += (val) as u16,
-            Color::Blue => px.0[2] += (val) as u16,
+    for row in 0..file.height {
+        for col in 0..file.width {
+            let rr = (row + r_off) * factor + rowstart;
+            let cc = (col + c_off) * factor + colstart;
+            if rr >= out_height || cc >= out_width {
+                continue;
+            }
+            let ch = dng_color_channel(row, col);
+            let v = file.get_pixel(col, row);
+            let base = ((rr * out_width + cc) * 3) as usize;
+            out[base + ch] = v;
         }
     }
-
-    px
 }
 
 fn main() {
@@ -176,50 +176,69 @@ fn main() {
         panic!("some files are missing");
     }
 
-    let imgbuf = match files.len() {
-        4 => {
-            info!("creating buffer");
-            let mut imgbuf = image::ImageBuffer::new(files[0].width, files[0].height);
-
-            info!("merging 4");
-            imgbuf.par_enumerate_pixels_mut().for_each(|(x, y, pixel)| {
-                *pixel = merge_4(&files[..4], x, y);
-            });
-
-            imgbuf
-        }
-        16 => {
-            let groups = files.chunks(4).collect::<Vec<&[RawImage]>>();
-
-            info!("creating buffer");
-            let mut imgbuf = image::ImageBuffer::new(files[0].width * 2, files[0].height * 2);
-
-            info!("merging 16");
-
-            imgbuf.par_enumerate_pixels_mut().for_each(|(x, y, pixel)| {
-                // 16 images mode works by doing the 4-way bayer merge 4 times but shifted by half a pixel in a 2x2 grid
-                // the 2x2 grid is for each pixel, so the resulting image is quadrupled in size
-                // +----+----+
-                // | 0  | 1  |
-                // +----+----+
-                // | 2  | 3  |
-                // +----+----+
-                match (x % 2, y % 2) {
-                    (0, 0) => *pixel = merge_4(groups[0], x / 2, y / 2),
-                    (1, 0) => *pixel = merge_4(groups[1], x / 2, y / 2),
-                    (0, 1) => *pixel = merge_4(groups[2], x / 2, y / 2),
-                    (1, 1) => *pixel = merge_4(groups[3], x / 2, y / 2),
-                    _ => unreachable!(),
-                }
-            });
-
-            imgbuf
-        }
-        _ => panic!("unsupported number of files"),
+    // make_arq's out16.ARQ is a TIFF/DNG "Linear Raw" with 3 channels (RGB16),
+    // where each pixel stores only one of (R,G,B) depending on Bayer position.
+    let (out_width, out_height, factor) = match files.len() {
+        4 => (files[0].width, files[0].height, 1u32),
+        16 => (files[0].width * 2, files[0].height * 2, 2u32),
+        _ => panic!("unsupported number of files (expected 4 or 16)"),
     };
 
-    info!("saving");
-    imgbuf.save(&args.output_file).unwrap();
+    info!("creating DNG-style RGB buffer {}x{}", out_width, out_height);
+    let mut out = vec![0u16; (out_width as usize) * (out_height as usize) * 3];
+
+    info!("placing frame data");
+    for (idx, file) in files.iter().enumerate() {
+        fill_sony_frame_dng_rgb(&mut out, out_width, out_height, file, idx as u32, factor);
+    }
+
+    info!("saving TIFF container (will be tagged as DNG/LinearRaw via exiftool)");
+    let f = std::fs::File::create(&args.output_file).unwrap();
+    let mut enc = tiff::encoder::TiffEncoder::new(BufWriter::new(f)).unwrap();
+    enc.write_image::<tiff::encoder::colortype::RGB16>(out_width, out_height, &out)
+        .unwrap();
+
+    info!("applying DNG/ARQ tags via exiftool");
+    let src = &files[0].exif;
+    let mut cmd = std::process::Command::new("exiftool");
+    cmd.arg("-overwrite_original");
+    cmd.arg(format!("-Software={}", "psmsmerge"));
+    if !src.make.is_empty() {
+        cmd.arg(format!("-Make={}", src.make));
+    }
+    if !src.model.is_empty() {
+        cmd.arg(format!("-Model={}", src.model));
+    }
+    cmd.arg("-SamplesPerPixel=3");
+    cmd.arg("-BitsPerSample=16 16 16");
+    // TIFF PhotometricInterpretation = 34892 (0x884C) is "Linear Raw"
+    cmd.arg("-PhotometricInterpretation=34892");
+    cmd.arg("-DNGVersion=1.1.0.0");
+    if let Some(wb) = src.wb_rggb_levels {
+        cmd.arg(format!(
+            "-WB_RGGBLevels={} {} {} {}",
+            wb[0], wb[1], wb[2], wb[3]
+        ));
+    }
+    if let Some(black) = src.black_level {
+        cmd.arg(format!(
+            "-BlackLevel={} {} {} {}",
+            black[0], black[1], black[2], black[3]
+        ));
+    }
+    if let Some(white) = src.white_level {
+        cmd.arg(format!(
+            "-WhiteLevel={} {} {} {}",
+            white[0], white[1], white[2], white[3]
+        ));
+    }
+    cmd.arg(&args.output_file);
+    let outp = cmd
+        .output()
+        .expect("failed to execute exiftool for tagging");
+    if !outp.status.success() {
+        panic!("exiftool failed: {}", String::from_utf8_lossy(&outp.stderr));
+    }
 
     info!("done in {:?}", now.elapsed());
 }
